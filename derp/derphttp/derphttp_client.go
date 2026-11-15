@@ -320,6 +320,17 @@ func (c *Client) preferIPv6() bool {
 	return false
 }
 
+// HookUpgradeWebsocket, if set, makes DERP clients use a WebSocket
+// handshake (with the "derp" subprotocol) in place of the usual HTTP
+// "Upgrade: DERP" request. This helps behind HTTP proxies that allow
+// WebSocket upgrades but block others.
+//
+// Dialing (including any HTTP proxy CONNECT) and TLS happen as usual.
+// The hook is then called with that connection, the context bounding the
+// handshake, and the DERP server URL. It must return a net.Conn that
+// carries the DERP protocol in binary WebSocket messages.
+var HookUpgradeWebsocket feature.Hook[func(ctx context.Context, conn net.Conn, urlStr string) (net.Conn, error)]
+
 // dialWebsocketFunc is non-nil (set by websocket.go's init) when compiled in.
 var dialWebsocketFunc func(ctx context.Context, urlStr string) (net.Conn, error)
 
@@ -505,6 +516,21 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		httpConn = tcpConn
 	}
 
+	upgradeWebsocket, useWebsocket := HookUpgradeWebsocket.GetOk()
+	if useWebsocket {
+		urlStr := c.urlString(node)
+		wsConn, err := upgradeWebsocket(ctx, httpConn, urlStr)
+		if err != nil {
+			c.logf("%s: websocket to %v error: %v", caller, urlStr, err)
+			return nil, 0, err
+		}
+		httpConn = wsConn
+		// The server only skips its greeting for the fast start
+		// below, which the WebSocket handshake can't use, so make
+		// derp.NewClient read the server's key from the greeting.
+		serverPub = key.NodePublic{}
+	}
+
 	brw := bufio.NewReadWriter(bufio.NewReader(httpConn), bufio.NewWriter(httpConn))
 	var derpClient *derp.Client
 
@@ -527,7 +553,9 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		// https://github.com/tailscale/tailscale/issues/12724
 	}
 
-	if !serverPub.IsZero() && serverProtoVersion != 0 {
+	if useWebsocket {
+		// The WebSocket handshake above replaced the HTTP upgrade.
+	} else if !serverPub.IsZero() && serverProtoVersion != 0 {
 		// parseMetaCert found the server's public key (no TLS
 		// middlebox was in the way), so skip the HTTP upgrade
 		// exchange.  See https://github.com/tailscale/tailscale/issues/693

@@ -22,10 +22,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/coder/websocket"
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/derp/derpserver"
@@ -33,6 +35,7 @@ import (
 	"tailscale.com/net/memnet"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netx"
+	"tailscale.com/net/wsconn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
@@ -705,7 +708,7 @@ func TestConnectThroughProxyHonorsDERPPort(t *testing.T) {
 	restore := feature.HookProxyFromEnvironment.SetForTest(func(*http.Request) (*url.URL, error) {
 		return proxyURL, nil
 	})
-	defer restore()
+	t.Cleanup(restore)
 
 	region := &tailcfg.DERPRegion{
 		RegionID:   1,
@@ -743,5 +746,74 @@ func TestConnectThroughProxyHonorsDERPPort(t *testing.T) {
 
 	if got, want := <-targets, fmt.Sprintf("127.0.0.1:%d", derpPort); got != want {
 		t.Errorf("proxy CONNECT target = %q, want %q", got, want)
+	}
+}
+
+// TestHookUpgradeWebsocket checks that clients use HookUpgradeWebsocket in
+// place of the "Upgrade: DERP" request, which this server refuses like some
+// HTTP proxies do.
+func TestHookUpgradeWebsocket(t *testing.T) {
+	var upgrades atomic.Int32
+	restore := derphttp.HookUpgradeWebsocket.SetForTest(func(ctx context.Context, conn net.Conn, urlStr string) (net.Conn, error) {
+		upgrades.Add(1)
+		dial := func(context.Context, string, string) (net.Conn, error) { return conn, nil }
+		wc, _, err := websocket.Dial(ctx, urlStr, &websocket.DialOptions{
+			HTTPClient:   &http.Client{Transport: &http.Transport{DialContext: dial}},
+			Subprotocols: []string{"derp"},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return wsconn.NetConn(context.Background(), wc, websocket.MessageBinary, urlStr), nil
+	})
+	t.Cleanup(restore)
+
+	s := derpserver.New(key.NewNode(), t.Logf)
+	noDERPUpgrade := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "derp") {
+			http.Error(w, "DERP upgrade blocked", http.StatusForbidden)
+			return
+		}
+		derpserver.Handler(s).ServeHTTP(w, r)
+	})
+	httpsrv := httptest.NewServer(derpserver.AddWebSocketSupport(s, noDERPUpgrade))
+	t.Cleanup(httpsrv.Close)
+	t.Cleanup(func() { s.Close() }) // before httpsrv.Close, which waits for handlers
+
+	netMon := netmon.NewStatic()
+	newClient := func() (*derphttp.Client, key.NodePublic) {
+		k := key.NewNode()
+		c, err := derphttp.NewClient(k, httpsrv.URL+"/derp", t.Logf, netMon)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		if err := c.Connect(context.Background()); err != nil {
+			t.Fatalf("Connect: %v", err)
+		}
+		waitConnect(t, c)
+		return c, k.Public()
+	}
+	c1, _ := newClient()
+	c2, k2 := newClient()
+	if got := upgrades.Load(); got != 2 {
+		t.Errorf("hook called %d times; want 2", got)
+	}
+
+	msg := []byte("hello over websockets")
+	if err := c1.Send(k2, msg); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		m, err := c2.Recv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p, ok := m.(derp.ReceivedPacket); ok {
+			if !bytes.Equal(p.Data, msg) {
+				t.Errorf("got %q; want %q", p.Data, msg)
+			}
+			return
+		}
 	}
 }
